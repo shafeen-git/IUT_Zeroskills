@@ -1,12 +1,13 @@
 import asyncio
 
-from fastapi import FastAPI, status
+from fastapi import FastAPI, HTTPException, status
 from fastapi.responses import JSONResponse
 from pydantic import ValidationError
 from app.config import get_config, get_runtime_secret
 from app.directives import DirectiveValidationError, validate_directive_interpretation
 from app.interpreter import call_llm_interpreter
 from app.models import OptimizeRequest, OptimizeResponse
+from app.optimizer import optimize_energy
 
 # Initialize FastAPI application
 app = FastAPI(
@@ -39,29 +40,6 @@ SUPPORTED_DIRECTIVES = [
 ]
 
 
-async def run_math_optimizer(hours: list, battery: dict, directives: list) -> dict:
-    hourly_plan = []
-    for hour in hours:
-        plan_pairs = [
-            ["hour", hour["hour"]],
-            ["grid_kwh", 0.0],
-            ["solar_used_kwh", 0.0],
-            ["battery_action", "idle"],
-            ["battery_kwh", 0.0],
-            ["battery_energy_after_kwh", battery["initial_energy_kwh"]],
-        ]
-        hourly_plan.append(dict(plan_pairs))
-
-    result_pairs = [
-        ["hourly_plan", hourly_plan],
-        ["total_grid_kwh", 0.0],
-        ["total_cost_bdt", 0.0],
-        ["peak_grid_kwh", 0.0],
-        ["plan_summary", "Dummy optimization result."],
-    ]
-    return dict(result_pairs)
-
-
 @app.get(
     "/health",
     status_code=status.HTTP_200_OK,
@@ -85,21 +63,38 @@ def health_check():
     summary="Optimize Energy Schedule",
     tags=["Optimization"],
 )
-async def optimize_energy(request: OptimizeRequest):
+async def optimize_energy_route(request: OptimizeRequest):
     try:
         async def run_pipeline():
-            llm_directives = await call_llm_interpreter(request.operator_notes)
+            llm_directives = call_llm_interpreter(request.operator_notes, request.battery.capacity_kwh)
             validate_directive_interpretation(llm_directives)
             validated_directives = llm_directives
-            optimizer_result = await run_math_optimizer(
-                [hour.model_dump() for hour in request.hours],
-                request.battery.model_dump(),
-                validated_directives,
-            )
+
+            lp_status, schedule = optimize_energy(request, validated_directives)
+            if lp_status != "Optimal":
+                return JSONResponse(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    content={"detail": f"Optimization failed: LP status was '{lp_status}'"},
+                )
+
+            tariff_by_hour = {hour_entry.hour: hour_entry.tariff_bdt_per_kwh for hour_entry in request.hours}
+            total_grid_kwh = 0.0
+            total_cost_bdt = 0.0
+            peak_grid_kwh = 0.0
+            for plan in schedule:
+                total_grid_kwh += float(plan.grid_kwh)
+                total_cost_bdt += float(plan.grid_kwh) * float(tariff_by_hour.get(plan.hour, 0.0))
+                if float(plan.grid_kwh) > peak_grid_kwh:
+                    peak_grid_kwh = float(plan.grid_kwh)
+
             return OptimizeResponse(
                 scenario_id=request.scenario_id,
                 directive_interpretation=validated_directives,
-                **optimizer_result,
+                hourly_plan=schedule,
+                total_grid_kwh=round(total_grid_kwh, 2),
+                total_cost_bdt=round(total_cost_bdt, 2),
+                peak_grid_kwh=round(peak_grid_kwh, 2),
+                plan_summary="Operates under interpreted operator directives and minimizes total grid import cost.",
             )
 
         response = await asyncio.wait_for(
@@ -117,11 +112,11 @@ async def optimize_energy(request: OptimizeRequest):
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             content={"detail": str(exc)},
         )
-    except asyncio.TimeoutError:
-        return JSONResponse(
+    except asyncio.TimeoutError as exc:
+        raise HTTPException(
             status_code=status.HTTP_504_GATEWAY_TIMEOUT,
-            content={"detail": "Optimization timed out"},
-        )
+            detail="Optimization timed out",
+        ) from exc
     except Exception:
         return JSONResponse(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
