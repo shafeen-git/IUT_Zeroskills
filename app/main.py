@@ -5,6 +5,7 @@ from fastapi.responses import JSONResponse
 from pydantic import ValidationError
 from app.config import get_config, get_runtime_secret
 from app.directives import DirectiveValidationError, validate_directive_interpretation
+from app.interpreter import call_llm_interpreter
 from app.models import OptimizeRequest, OptimizeResponse
 
 # Initialize FastAPI application
@@ -36,20 +37,6 @@ SUPPORTED_DIRECTIVES = [
     "max_grid_window",
     "no_op",
 ]
-
-
-async def call_llm_interpreter(operator_notes: list[str]) -> list[dict]:
-    directive_interpretations = []
-    for note_index, _ in enumerate(operator_notes):
-        directive_pairs = [
-            ["note_index", note_index],
-            ["applies", False],
-            ["directive_type", "no_op"],
-            ["structured_adjustment", None],
-            ["explanation", "No optimization directive was applied."],
-        ]
-        directive_interpretations.append(dict(directive_pairs))
-    return directive_interpretations
 
 
 async def run_math_optimizer(hours: list, battery: dict, directives: list) -> dict:
