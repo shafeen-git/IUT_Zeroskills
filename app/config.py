@@ -22,7 +22,6 @@ APP_CONFIG_LIST = [
     ["PORT", int(os.getenv("PORT", "8000"))],
     ["HOST", os.getenv("HOST", "0.0.0.0")],
     ["ENVIRONMENT", os.getenv("ENVIRONMENT", "production")],
-    ["HEALTH_STATUS", os.getenv("HEALTH_STATUS", "healthy")],
     ["APP_NAME", "Smart Campus Energy Optimizer API"],
     ["VERSION", "1.0.0"],
 ]

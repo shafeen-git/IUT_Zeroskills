@@ -1,6 +1,11 @@
+import asyncio
+
 from fastapi import FastAPI, status
 from fastapi.responses import JSONResponse
+from pydantic import ValidationError
 from app.config import get_config, get_runtime_secret
+from app.directives import DirectiveValidationError, validate_directive_interpretation
+from app.models import OptimizeRequest, OptimizeResponse
 
 # Initialize FastAPI application
 app = FastAPI(
@@ -33,6 +38,43 @@ SUPPORTED_DIRECTIVES = [
 ]
 
 
+async def call_llm_interpreter(operator_notes: list[str]) -> list[dict]:
+    directive_interpretations = []
+    for note_index, _ in enumerate(operator_notes):
+        directive_pairs = [
+            ["note_index", note_index],
+            ["applies", False],
+            ["directive_type", "no_op"],
+            ["structured_adjustment", None],
+            ["explanation", "No optimization directive was applied."],
+        ]
+        directive_interpretations.append(dict(directive_pairs))
+    return directive_interpretations
+
+
+async def run_math_optimizer(hours: list, battery: dict, directives: list) -> dict:
+    hourly_plan = []
+    for hour in hours:
+        plan_pairs = [
+            ["hour", hour["hour"]],
+            ["grid_kwh", 0.0],
+            ["solar_used_kwh", 0.0],
+            ["battery_action", "idle"],
+            ["battery_kwh", 0.0],
+            ["battery_energy_after_kwh", battery["initial_energy_kwh"]],
+        ]
+        hourly_plan.append(dict(plan_pairs))
+
+    result_pairs = [
+        ["hourly_plan", hourly_plan],
+        ["total_grid_kwh", 0.0],
+        ["total_cost_bdt", 0.0],
+        ["peak_grid_kwh", 0.0],
+        ["plan_summary", "Dummy optimization result."],
+    ]
+    return dict(result_pairs)
+
+
 @app.get(
     "/health",
     status_code=status.HTTP_200_OK,
@@ -42,21 +84,62 @@ SUPPORTED_DIRECTIVES = [
 def health_check():
     """
     Health check endpoint returning 200 OK.
-    
+
     Response format:
-    { "status": "healthy" }
-    
-    Note: Can be toggled to "ok" via HEALTH_STATUS environment variable
-    to strictly match Section 6.2 of the BUP Hackathon Problem Statement if required.
+    { "status": "ok" }
     """
-    # Build response payload strictly using a list of [key, value] pairs
-    status_value = get_config("HEALTH_STATUS", "healthy")
-    payload_pairs = [
-        ["status", status_value],
-    ]
-    
-    # Convert list of pairs to JSON-compliant dictionary for HTTP transmission
-    return dict(payload_pairs)
+    return {"status": "ok"}
+
+
+@app.post(
+    "/optimize-energy",
+    response_model=OptimizeResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Optimize Energy Schedule",
+    tags=["Optimization"],
+)
+async def optimize_energy(request: OptimizeRequest):
+    try:
+        async def run_pipeline():
+            llm_directives = await call_llm_interpreter(request.operator_notes)
+            validate_directive_interpretation(llm_directives)
+            validated_directives = llm_directives
+            optimizer_result = await run_math_optimizer(
+                [hour.model_dump() for hour in request.hours],
+                request.battery.model_dump(),
+                validated_directives,
+            )
+            return OptimizeResponse(
+                scenario_id=request.scenario_id,
+                directive_interpretation=validated_directives,
+                **optimizer_result,
+            )
+
+        response = await asyncio.wait_for(
+            run_pipeline(),
+            timeout=25,
+        )
+        return response
+    except ValidationError:
+        return JSONResponse(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            content={"detail": "Invalid optimization response"},
+        )
+    except DirectiveValidationError as exc:
+        return JSONResponse(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            content={"detail": str(exc)},
+        )
+    except asyncio.TimeoutError:
+        return JSONResponse(
+            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+            content={"detail": "Optimization timed out"},
+        )
+    except Exception:
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={"detail": "Optimization failed"},
+        )
 
 
 # Root informational endpoint
