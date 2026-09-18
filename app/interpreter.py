@@ -1,191 +1,153 @@
+"""LLM interpretation of operator notes (Groq-hosted model), with per-note safe recovery."""
+
 import json
-import os
-import re
-from typing import Any, Dict, List
+import logging
 
-from groq import Groq
+from groq import NOT_GIVEN, Groq
+from pydantic import ValidationError
 
+from app.config import get_config, get_runtime_secret
+from app.directives import DirectiveValidationError, build_directive, no_op, validate_directive
+from app.fallback import rule_based_directive
 from app.models import DirectiveInterpretation
 
-# ----------------- GROQ CLIENT SETUP -----------------
+logger = logging.getLogger("gridwise.interpreter")
 
-GROQ_API_KEY = os.getenv("GROQ_API_KEY", "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")
-groq_client = Groq(api_key=GROQ_API_KEY)
+SYSTEM_PROMPT = """You extract machine-readable directives from campus energy operator notes.
+The schedule covers ONE day split into 24 hourly intervals: hour h runs from h:00 to h+1:00, h = 0..23.
 
-# ----------------- INTERPRETER & GUARDRAILS -----------------
+For EACH note choose exactly one directive_type:
+- "solar_reduction": usable solar/PV output is reduced or lost (cleaning, washing, dust, clouds, haze, shading, inverter work, panel inspection, panels offline, ...).
+- "minimum_battery_reserve": the battery/storage must keep AT LEAST some energy stored (reserve, backup, state of charge floor, "keep at least X in the battery").
+- "no_charge_window": the battery must not charge (charger isolated/unavailable/disabled, charging circuit down, no top-ups).
+- "no_discharge_window": the battery must not discharge (must not supply energy, no drawing from it, discharge blocked).
+- "max_grid_window": energy imported/drawn from the grid must stay at or below a limit (grid import/intake/draw, feeder, substation, transformer or utility limit).
+- "no_op": the note does not impose any of the above on today's schedule (unrelated announcements, menus, bookings, deadlines, events next week or month, billing, staffing, general information).
 
-SYSTEM_PROMPT = """You are an expert energy scheduling assistant for BUP Smart Campus.
-Your job is to interpret natural-language operator notes into a structured JSON array of directives for a 24-hour horizon (hours 0 to 23).
+Return JSON only, in exactly this form:
+{"directives": [{"note_index": 0, "directive_type": "...", "windows": [[start, end]], "percent": null, "percent_meaning": null, "amount": null, "amount_unit": null, "max_grid_kwh": null, "explanation": "one short sentence"}]}
 
-### SUPPORTED DIRECTIVE TYPES:
-1. "solar_reduction": Usable solar drops.
-   Required adjustment: {"hours": [int, ...], "factor": float}
-   * factor is the REMAINING usable fraction (0.0 to 1.0). E.g., an 80% reduction means factor = 0.2. "Drops to 25%" means factor = 0.25.
-2. "minimum_battery_reserve": Battery energy must stay at or above a threshold.
-   Required adjustment: {"hours": [int, ...], "minimum_energy_kwh": float}
-   * If given as a percentage, multiply by the battery capacity provided in the context. E.g., 50% of 200 kWh = 100.0.
-3. "no_charge_window": Battery cannot charge.
-   Required adjustment: {"hours": [int, ...]}
-4. "no_discharge_window": Battery cannot discharge.
-   Required adjustment: {"hours": [int, ...]}
-5. "max_grid_window": Grid import must stay at or below a limit.
-   Required adjustment: {"hours": [int, ...], "max_grid_kwh": float}
-6. "no_op": The note is an unrelated distractor (e.g., cafeteria, events, general campus announcements).
-   Required adjustment: null
+Time windows ("windows"):
+- A list of [start, end] pairs in 24-hour clock. start is INCLUDED, end is EXCLUDED.
+- "1 PM to 3 PM", "13:00-15:00", "between 1 PM and 3 PM", "from 1 PM until 3 PM", "1 PM through 3 PM" -> [13, 15].
+- noon = 12. Midnight at the END of a window = 24; at the START = 0. "from 10 PM until midnight" -> [22, 24].
+- One named hour ("at 5 PM", "during the 5 PM hour") -> [17, 18].
+- Open-ended: "from 6 PM onward"/"for the rest of the day" -> [18, 24]; "until 7 AM" with no start -> [0, 7].
+- No time mentioned at all -> [[0, 24]] (the whole day).
+- For no_op use [].
 
-### RULES:
-- Return exactly one entry per note, strictly matching the note_index (0, 1, ... N-1).
-- Time windows are start-inclusive and end-exclusive (e.g., 1 PM to 3 PM -> [13, 14]; noon to 2 PM -> [12, 13]).
-- hours array must contain unique integers from 0 to 23 in ascending order.
-- applies must be true for all directives EXCEPT "no_op", where applies must be false.
-- structured_adjustment must be null for "no_op".
-- Output MUST be valid JSON with top-level key "directives": an array of objects with keys: note_index, applies, directive_type, structured_adjustment, explanation.
-"""
+Values - copy numbers from the note; never invent a value that the note does not state:
+- solar_reduction: "percent" = the percentage number written in the note (0-100) and "percent_meaning":
+    "remaining" if it is how much solar is still usable ("drops to 20%", "treated as 25% of the forecast", "only 30% available", "leave about half" -> 50),
+    "reduction" if it is how much is lost ("cut by 70%", "an 80% reduction", "loses three quarters" -> 75).
+  Convert words to numbers: half = 50, a third = 33.33, a quarter = 25, three quarters = 75, a fifth = 20. Panels fully offline / no solar -> percent 0, "remaining".
+- minimum_battery_reserve: "amount" and "amount_unit" = "kwh" for an energy amount, or "percent" when it is a share of battery capacity or state of charge.
+- max_grid_window: "max_grid_kwh" = the per-hour limit in kWh (a kW limit held for one hour equals the same number of kWh; MW/MWh x 1000).
+- no_charge_window, no_discharge_window, no_op: leave all value fields null.
 
+Return exactly one object per note, with note_index 0..N-1 in the same order as the notes."""
 
-def parse_time_window(text: str) -> List[int]:
-    t = text.lower()
-    m = re.search(r'(\d{1,2})(?::00)?\s*(am|pm)?\s*(?:to|until|-)\s*(\d{1,2})(?::00)?\s*(am|pm)?', t)
-    start, end = None, None
-    if "noon" in t and ("until 2 pm" in t or "to 2 pm" in t):
-        start, end = 12, 14
-    elif "noon" in t and ("until 1 pm" in t or "to 1 pm" in t):
-        start, end = 12, 13
-    elif m:
-        s_val = int(m.group(1))
-        s_mer = m.group(2)
-        e_val = int(m.group(3))
-        e_mer = m.group(4)
-
-        if not s_mer and e_mer:
-            s_mer = e_mer
-        if s_mer == "pm" and s_val != 12:
-            s_val += 12
-        elif s_mer == "am" and s_val == 12:
-            s_val = 0
-        if e_mer == "pm" and e_val != 12:
-            e_val += 12
-        elif e_mer == "am" and e_val == 12:
-            e_val = 0
-        start, end = s_val, e_val
-
-    if start is not None and end is not None and start < end:
-        return list(range(start, end))
-    return []
+CACHE_SIZE = 128
+_client: Groq | None = None
+_cache: list = []  # [[notes, capacity_kwh], directives] entries, newest last
 
 
-def rule_based_fallback(note: str, idx: int, battery_cap: float) -> DirectiveInterpretation:
-    t = note.lower()
-    hours = parse_time_window(t)
+class LLMUnavailableError(RuntimeError):
+    pass
 
-    # Solar reduction
-    if any(k in t for k in ["solar", "pv", "panel", "sun"]):
-        if any(k in t for k in ["reduc", "drop", "wash", "clean", "cloud", "inverter", "inspection"]):
-            pct_match = re.search(r'(\d+)\s*%', t)
-            factor = 0.5
-            if pct_match:
-                val = float(pct_match.group(1)) / 100.0
-                if "drop to" in t or "leave" in t:
-                    factor = val
-                elif "reduction" in t or "cut" in t:
-                    factor = round(1.0 - val, 2)
-            elif "half" in t or "one-half" in t:
-                factor = 0.5
-            elif "one-fifth" in t:
-                factor = 0.2
-            return DirectiveInterpretation(
-                note_index=idx,
-                applies=True,
-                directive_type="solar_reduction",
-                structured_adjustment={"hours": sorted(list(set(hours))), "factor": factor},
-                explanation="Solar availability adjusted based on note.",
-            )
 
-    # No charge
-    if ("charge" in t or "charging" in t) and any(k in t for k in ["do not", "not charge", "disabled", "unavailable", "isolated", "outage"]):
-        return DirectiveInterpretation(
-            note_index=idx,
-            applies=True,
-            directive_type="no_charge_window",
-            structured_adjustment={"hours": sorted(list(set(hours)))},
-            explanation="Battery charging disabled during window.",
-        )
+def _groq_client() -> Groq:
+    global _client
+    if _client is None:
+        api_key = get_runtime_secret("GROQ_API_KEY")
+        if not api_key:
+            raise LLMUnavailableError("GROQ_API_KEY is not configured")
+        _client = Groq(api_key=api_key, timeout=get_config("LLM_TIMEOUT_SECONDS"), max_retries=1)
+    return _client
 
-    # No discharge
-    if ("discharge" in t or "discharging" in t) and any(k in t for k in ["do not", "not discharge", "disabled", "unavailable", "must not"]):
-        return DirectiveInterpretation(
-            note_index=idx,
-            applies=True,
-            directive_type="no_discharge_window",
-            structured_adjustment={"hours": sorted(list(set(hours)))},
-            explanation="Battery discharge disabled during window.",
-        )
 
-    # Minimum battery reserve
-    if any(k in t for k in ["reserve", "remain in the battery", "stored in the battery", "keep at least"]):
-        kwh_match = re.search(r'(\d+)\s*kwh', t)
-        pct_match = re.search(r'(\d+)\s*%', t)
-        min_kwh = 0.0
-        if kwh_match:
-            min_kwh = float(kwh_match.group(1))
-        elif pct_match:
-            min_kwh = (float(pct_match.group(1)) / 100.0) * battery_cap
-        return DirectiveInterpretation(
-            note_index=idx,
-            applies=True,
-            directive_type="minimum_battery_reserve",
-            structured_adjustment={"hours": sorted(list(set(hours))), "minimum_energy_kwh": min_kwh},
-            explanation="Battery reserve set.",
-        )
-
-    # Max grid window
-    if any(k in t for k in ["grid import", "grid intake", "grid limit", "transformer limit", "feeder"]):
-        kwh_match = re.search(r'(\d+)\s*kwh', t)
-        max_kwh = 150.0
-        if kwh_match:
-            max_kwh = float(kwh_match.group(1))
-        return DirectiveInterpretation(
-            note_index=idx,
-            applies=True,
-            directive_type="max_grid_window",
-            structured_adjustment={"hours": sorted(list(set(hours))), "max_grid_kwh": max_kwh},
-            explanation="Grid import capped during window.",
-        )
-
-    # Distractor / No-op
-    return DirectiveInterpretation(
-        note_index=idx,
-        applies=False,
-        directive_type="no_op",
-        structured_adjustment=None,
-        explanation="This note does not affect today's energy schedule.",
+def _ask_llm(notes: list[str], capacity_kwh: float) -> list:
+    user_content = (
+        f"Battery capacity: {capacity_kwh} kWh\n"
+        f"Operator notes (note_index: text):\n"
+        + "\n".join(f"{index}: {note}" for index, note in enumerate(notes))
     )
+    model = get_config("GROQ_MODEL")
+    response = _groq_client().chat.completions.create(
+        model=model,
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user_content},
+        ],
+        response_format={"type": "json_object"},
+        temperature=0,
+        reasoning_effort="low" if "gpt-oss" in model else NOT_GIVEN,
+    )
+    payload = json.loads(response.choices[0].message.content or "")
+    entries = payload.get("directives") if isinstance(payload, dict) else None
+    if not isinstance(entries, list):
+        raise ValueError("LLM response has no directives list")
+    return entries
 
 
-def call_llm_interpreter(notes: List[str], battery_cap: float) -> List[DirectiveInterpretation]:
-    if not notes:
-        return []
+def _entry_for(entries: list, note_index: int, note_count: int):
+    for entry in entries:
+        if isinstance(entry, dict) and entry.get("note_index") == note_index:
+            return entry
+    if len(entries) == note_count and isinstance(entries[note_index], dict):
+        return entries[note_index]
+    return None
+
+
+def _fallback(note_index: int, note: str, capacity_kwh: float) -> DirectiveInterpretation:
+    try:
+        directive = rule_based_directive(note_index, note, capacity_kwh)
+        validate_directive(directive, capacity_kwh)
+        return directive
+    except (DirectiveValidationError, ValidationError):
+        return no_op(note_index, "Note could not be interpreted safely; no constraint applied.")
+
+
+def _cached(key: list):
+    for cached_key, directives in _cache:
+        if cached_key == key:
+            return directives
+    return None
+
+
+def _remember(key: list, directives: list[DirectiveInterpretation]) -> None:
+    _cache.append([key, directives])
+    if len(_cache) > CACHE_SIZE:
+        _cache.pop(0)
+
+
+def interpret_notes(notes: list[str], capacity_kwh: float) -> tuple[list[DirectiveInterpretation], str]:
+    """Return one validated directive per note and the interpretation source (llm, llm-cache, llm+fallback, fallback)."""
+    key = [list(notes), capacity_kwh]
+    cached = _cached(key)
+    if cached is not None:
+        return cached, "llm-cache"
 
     try:
-        user_content = f"Campus Battery Capacity: {battery_cap} kWh\nOperator Notes:\n{json.dumps(notes, indent=2)}"
-        response = groq_client.chat.completions.create(
-            model="openai/gpt-oss-20b",
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": user_content},
-            ],
-            response_format={"type": "json_object"},
-            temperature=0.0,
-        )
-        content = response.choices[0].message.content
-        if not content:
-            raise ValueError("Empty LLM response")
-        data = json.loads(content)
-        raw_list = data.get("directives", data.get("directive_interpretation", []))
-        if isinstance(raw_list, list) and len(raw_list) == len(notes):
-            return [DirectiveInterpretation(**item) for item in raw_list]
-    except Exception:
-        pass
+        entries = _ask_llm(notes, capacity_kwh)
+    except Exception as exc:
+        logger.warning("LLM interpretation unavailable (%s); using rule-based fallback", type(exc).__name__)
+        return [_fallback(index, note, capacity_kwh) for index, note in enumerate(notes)], "fallback"
 
-    # Safety fallback to regex rules if API fails or network drops
-    return [rule_based_fallback(note, i, battery_cap) for i, note in enumerate(notes)]
+    directives = []
+    recovered = 0
+    for index, note in enumerate(notes):
+        entry = _entry_for(entries, index, len(notes))
+        try:
+            if entry is None:
+                raise DirectiveValidationError("LLM returned no entry for this note")
+            directives.append(build_directive(index, entry, capacity_kwh))
+        except (DirectiveValidationError, ValidationError) as exc:
+            logger.warning("LLM entry for note %d rejected by guardrails: %s", index, exc)
+            directives.append(_fallback(index, note, capacity_kwh))
+            recovered += 1
+
+    if recovered:
+        return directives, "llm+fallback"
+    _remember(key, directives)
+    return directives, "llm"

@@ -35,13 +35,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PORT=8000 \
     HOST=0.0.0.0
 
-# Copy compiled virtual environment from builder
+# Copy compiled virtual environment from builder (includes the HiGHS LP solver wheel)
 COPY --from=builder /opt/venv /opt/venv
-
-# Install coinor-cbc solver for PuLP optimization
-RUN apt-get update && \
-    apt-get install --no-install-recommends -y coinor-cbc && \
-    rm -rf /var/lib/apt/lists/*
 
 # Create a non-root system user for secure container execution
 RUN groupadd -r appuser && useradd -r -g appuser -d /app -s /sbin/nologin appuser

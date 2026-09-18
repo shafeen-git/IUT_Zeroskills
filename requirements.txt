@@ -1,7 +1,9 @@
-fastapi>=0.115.0
-uvicorn[standard]>=0.30.0
-pydantic>=2.8.0
-python-dotenv>=1.0.1
-pulp>=2.8.0
-requests>=2.31.0
-groq>=0.9.0
+fastapi==0.141.1
+uvicorn[standard]==0.53.0
+pydantic==2.13.5
+python-dotenv==1.2.3
+pulp==3.3.2
+highspy==1.15.1
+groq==1.7.0
+httpx==0.28.1
+requests==2.34.2

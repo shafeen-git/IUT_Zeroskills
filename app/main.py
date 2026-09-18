@@ -1,136 +1,126 @@
-import asyncio
+import logging
+import time
 
-from fastapi import FastAPI, HTTPException, status
+from fastapi import FastAPI, Request, status
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
-from pydantic import ValidationError
-from app.config import get_config, get_runtime_secret
-from app.directives import DirectiveValidationError, validate_directive_interpretation
-from app.interpreter import call_llm_interpreter
-from app.models import OptimizeRequest, OptimizeResponse
-from app.optimizer import optimize_energy
 
-# Initialize FastAPI application
+from app.config import get_config
+from app.directives import validate_interpretations
+from app.interpreter import interpret_notes
+from app.models import DirectiveInterpretation, HourlyPlan, OptimizeRequest, OptimizeResponse
+from app.optimizer import InfeasibleScheduleError, solve_schedule
+from app.replay import find_violations
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+logger = logging.getLogger("gridwise.api")
+
 app = FastAPI(
-    title=get_config("APP_NAME", "Smart Campus Energy Optimizer API"),
-    version=get_config("VERSION", "1.0.0"),
+    title=get_config("APP_NAME"),
+    version=get_config("VERSION"),
     docs_url="/docs",
     redoc_url="/redoc",
 )
 
-# ==============================================================================
-# DATA STRUCTURE RULE ENFORCEMENT:
-# Strictly use lists instead of maps (dictionaries/objects) whenever grouping
-# or implementing internal data structures throughout the codebase.
-# ==============================================================================
-
-# Route registry stored as a list of route definitions [method, path, description]
-REGISTERED_ROUTES = [
-    ["GET", "/health", "Service health check endpoint"],
-    ["POST", "/optimize-energy", "Energy schedule optimization endpoint (Hackathon main)"],
-]
-
-# Supported hackathon operator directive types stored as a list
-SUPPORTED_DIRECTIVES = [
-    "solar_reduction",
-    "minimum_battery_reserve",
-    "no_charge_window",
-    "no_discharge_window",
-    "max_grid_window",
-    "no_op",
-]
+MAX_REPORTED_ERRORS = 10
 
 
-@app.get(
-    "/health",
-    status_code=status.HTTP_200_OK,
-    summary="Health Check",
-    tags=["System"],
-)
+@app.exception_handler(RequestValidationError)
+async def malformed_request(_: Request, exc: RequestValidationError):
+    errors = [
+        ".".join(str(part) for part in error.get("loc", [])) + ": " + str(error.get("msg", "invalid"))
+        for error in exc.errors()[:MAX_REPORTED_ERRORS]
+    ]
+    return JSONResponse(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        content={"detail": "Malformed JSON or structurally invalid request", "errors": errors},
+    )
+
+
+def semantic_problem(request: OptimizeRequest) -> str | None:
+    battery = request.battery
+    if battery.minimum_energy_kwh > battery.capacity_kwh:
+        return "battery.minimum_energy_kwh exceeds battery.capacity_kwh"
+    if not battery.minimum_energy_kwh <= battery.initial_energy_kwh <= battery.capacity_kwh:
+        return "battery.initial_energy_kwh must lie between minimum_energy_kwh and capacity_kwh"
+    return None
+
+
+def _hour_ranges(hours: list[int]) -> str:
+    if not hours:
+        return "none"
+    ranges = []
+    start = previous = hours[0]
+    for hour in hours[1:] + [None]:
+        if hour is not None and hour == previous + 1:
+            previous = hour
+            continue
+        ranges.append(f"{start}" if start == previous else f"{start}-{previous}")
+        if hour is not None:
+            start = previous = hour
+    return ", ".join(ranges)
+
+
+def plan_summary(directives: list[DirectiveInterpretation], plan: list[HourlyPlan], total_cost: float) -> str:
+    applied = [d.directive_type for d in directives if d.applies]
+    ignored = len(directives) - len(applied)
+    charging = [step.hour for step in plan if step.battery_action == "charge"]
+    discharging = [step.hour for step in plan if step.battery_action == "discharge"]
+    return (
+        f"Applied {len(applied)} operator directive(s) ({', '.join(applied) or 'none'}); "
+        f"{ignored} note(s) ignored as no_op. Battery charges in hours {_hour_ranges(charging)} and "
+        f"discharges in hours {_hour_ranges(discharging)}, returning to its initial energy after hour 23. "
+        f"Minimum-cost grid purchase: {total_cost:.2f} BDT."
+    )
+
+
+@app.get("/health", status_code=status.HTTP_200_OK, tags=["System"])
 def health_check():
-    """
-    Health check endpoint returning 200 OK.
-
-    Response format:
-    { "status": "ok" }
-    """
     return {"status": "ok"}
 
 
-@app.post(
-    "/optimize-energy",
-    response_model=OptimizeResponse,
-    status_code=status.HTTP_200_OK,
-    summary="Optimize Energy Schedule",
-    tags=["Optimization"],
-)
-async def optimize_energy_route(request: OptimizeRequest):
+@app.post("/optimize-energy", response_model=OptimizeResponse, tags=["Optimization"])
+def optimize_energy_route(request: OptimizeRequest):
+    started = time.perf_counter()
+    problem = semantic_problem(request)
+    if problem:
+        return JSONResponse(status_code=422, content={"detail": problem})
+
     try:
-        async def run_pipeline():
-            llm_directives = call_llm_interpreter(request.operator_notes, request.battery.capacity_kwh)
-            validate_directive_interpretation(llm_directives)
-            validated_directives = llm_directives
+        capacity = request.battery.capacity_kwh
+        directives, source = interpret_notes(request.operator_notes, capacity)
+        validate_interpretations(directives, len(request.operator_notes), capacity)
+        plan = solve_schedule(request, directives)
 
-            lp_status, schedule = optimize_energy(request, validated_directives)
-            if lp_status != "Optimal":
-                return JSONResponse(
-                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                    content={"detail": f"Optimization failed: LP status was '{lp_status}'"},
-                )
+        violations = find_violations(request, directives, plan)
+        if violations:
+            logger.error("scenario %s failed final replay: %s", request.scenario_id, "; ".join(violations[:5]))
 
-            tariff_by_hour = {hour_entry.hour: hour_entry.tariff_bdt_per_kwh for hour_entry in request.hours}
-            total_grid_kwh = 0.0
-            total_cost_bdt = 0.0
-            peak_grid_kwh = 0.0
-            for plan in schedule:
-                total_grid_kwh += float(plan.grid_kwh)
-                total_cost_bdt += float(plan.grid_kwh) * float(tariff_by_hour.get(plan.hour, 0.0))
-                if float(plan.grid_kwh) > peak_grid_kwh:
-                    peak_grid_kwh = float(plan.grid_kwh)
-
-            return OptimizeResponse(
-                scenario_id=request.scenario_id,
-                directive_interpretation=validated_directives,
-                hourly_plan=schedule,
-                total_grid_kwh=round(total_grid_kwh, 2),
-                total_cost_bdt=round(total_cost_bdt, 2),
-                peak_grid_kwh=round(peak_grid_kwh, 2),
-                plan_summary="Operates under interpreted operator directives and minimizes total grid import cost.",
-            )
-
-        response = await asyncio.wait_for(
-            run_pipeline(),
-            timeout=25,
+        total_grid = round(sum(step.grid_kwh for step in plan), 6)
+        total_cost = round(sum(step.grid_kwh * entry.tariff_bdt_per_kwh for step, entry in zip(plan, request.hours)), 6)
+        response = OptimizeResponse(
+            scenario_id=request.scenario_id,
+            directive_interpretation=directives,
+            hourly_plan=plan,
+            total_grid_kwh=total_grid,
+            total_cost_bdt=total_cost,
+            peak_grid_kwh=max(step.grid_kwh for step in plan),
+            plan_summary=plan_summary(directives, plan, total_cost),
         )
-        return response
-    except ValidationError:
+    except InfeasibleScheduleError:
         return JSONResponse(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            content={"detail": "Invalid optimization response"},
+            status_code=422,
+            content={"detail": "No feasible schedule satisfies the battery rules and the interpreted directives"},
         )
-    except DirectiveValidationError as exc:
-        return JSONResponse(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            content={"detail": str(exc)},
-        )
-    except asyncio.TimeoutError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
-            detail="Optimization timed out",
-        ) from exc
-    except Exception:
+    except Exception as exc:
+        logger.error("scenario %s failed: %s", request.scenario_id, type(exc).__name__)
         return JSONResponse(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            content={"detail": "Optimization failed"},
+            content={"detail": "Internal error while optimizing the schedule"},
         )
 
-
-# Root informational endpoint
-@app.get("/", status_code=status.HTTP_200_OK, include_in_schema=False)
-def root():
-    info_pairs = [
-        ["service", get_config("APP_NAME")],
-        ["version", get_config("VERSION")],
-        ["routes", REGISTERED_ROUTES],
-        ["status", "running"],
-    ]
-    return dict(info_pairs)
+    logger.info(
+        "scenario %s interpreted via %s, cost %.2f BDT, %.0f ms",
+        request.scenario_id, source, total_cost, (time.perf_counter() - started) * 1000,
+    )
+    return response
