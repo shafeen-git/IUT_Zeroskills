@@ -1,0 +1,55 @@
+# Environment Variables & Secrets
+.env
+.env.*
+*.env
+!.env.example
+*.key
+*.pem
+secrets/
+
+# Python cache and build artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environments
+venv/
+.venv/
+env/
+ENV/
+
+# Node artifacts (in case hybrid tooling is used)
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Editor & System files
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+BUP_CSE_FEST_2026_Preli_Public_Sample_Cases.json
+.puku/puku-embeddings.db
+.puku/puku-embeddings.db-shm
+.puku/puku-embeddings.db-wal
+.gitignore
