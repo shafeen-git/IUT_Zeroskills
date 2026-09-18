@@ -14,15 +14,15 @@ Objective:
 
 Hard constraints (GridWise base):
     1. Energy balance per hour:
-       grid_import[t] + solar[t] + discharge[t] - charge[t] == load[t]
+         grid_import[t] + effective_solar[t] + discharge[t] - charge[t] == load[t]
     2. SoC dynamics:
-       soc[t] == soc[t-1] + charge[t] * eta_c - discharge[t] / eta_d   (with soc[-1] = soc0)
+         soc[t] == soc[t-1] + charge[t] - discharge[t]   (with soc[-1] = soc0)
     3. SoC bounds: 0 <= soc[t] <= capacity
     4. Power rate limits: charge[t] <= max_charge, discharge[t] <= max_discharge
     5. End-of-day neutrality: soc[23] == soc0
 
 Operator directives (applied AFTER validation):
-    - solar_reduction      : cap grid_import during solar-peak hours
+    - solar_reduction      : set effective_solar[t] to solar[t] * factor
     - minimum_battery_reserve : soc[t] >= reserve_kwh for hours in window
     - no_charge_window      : charge[t] == 0 for hours in window
     - no_discharge_window   : discharge[t] == 0 for hours in window
@@ -115,10 +115,11 @@ def _empty_schedule():
     ]
 
 
-def _apply_directive(prob, vars_, directive):
+def _apply_directive(prob, vars_, effective_solar, solar, directive):
     """
     Apply a single validated directive to the LP.
     `vars_` is a list of [hour, charge, discharge, grid_import, soc] variables.
+    `effective_solar` is the solar series used by the energy-balance constraints.
     `directive` is a list-of-pairs dict matching the data-structure rule:
         ["type", "solar_reduction"] etc., plus type-specific params.
     """
@@ -131,17 +132,19 @@ def _apply_directive(prob, vars_, directive):
         return
 
     if dtype == "solar_reduction":
-        # Cap grid import during solar hours (default 10..15 if no window given)
-        # Inject defaults BEFORE validating so the window default is also checked
-        params.setdefault("start_hour", 10)
-        params.setdefault("end_hour", 15)
-        params.setdefault("max_kw", 0.0)
-        start, end = _validate_window(params, dtype)
-        _validate_non_negative(params, dtype, "max_kw")
-        cap = float(params.get("max_kw"))
-        for h, ch, dis, gi, soc in vars_:
-            if start <= h <= end:
-                prob += gi <= cap
+        # Apply the reduction to solar generation, not to grid imports.
+        try:
+            factor = float(params["factor"])
+        except (TypeError, ValueError, KeyError):
+            raise OptimizerInputError(
+                f"{dtype}: factor must be numeric (got {params.get('factor')!r})"
+            )
+        if not 0 <= factor <= 1:
+            raise OptimizerInputError(
+                f"{dtype}: factor must be between 0 and 1 (got {factor})"
+            )
+        for h in HOURS:
+            prob += effective_solar[h] == solar[h] * factor
 
     elif dtype == "minimum_battery_reserve":
         start, end = _validate_window(params, dtype)
@@ -186,8 +189,6 @@ def optimize_energy(request):
               ["initial_soc_kwh", 50.0],
               ["max_charge_kw", 50.0],
               ["max_discharge_kw", 50.0],
-              ["charge_efficiency", 0.95],
-              ["discharge_efficiency", 0.95],
           ]],
           ["directives", [ list-of-directives, ... ]],   # each is list-of-pairs
         ]
@@ -207,8 +208,6 @@ def optimize_energy(request):
     soc0 = float(bat["initial_soc_kwh"])
     max_ch = float(bat["max_charge_kw"])
     max_dis = float(bat["max_discharge_kw"])
-    eta_c = float(bat.get("charge_efficiency", 1.0))
-    eta_d = float(bat.get("discharge_efficiency", 1.0))
 
     directives = rd.get("directives", [])
 
@@ -218,28 +217,40 @@ def optimize_energy(request):
     discharge = [LpVariable(f"discharge_{h}", lowBound=0, upBound=max_dis) for h in HOURS]
     grid_imp = [LpVariable(f"grid_{h}", lowBound=0) for h in HOURS]
     soc = [LpVariable(f"soc_{h}", lowBound=0, upBound=capacity) for h in HOURS]
+    effective_solar = [
+        LpVariable(f"effective_solar_{h}", lowBound=0)
+        for h in HOURS
+    ]
 
     # Pack vars as list-of-pairs for directive dispatch
     vars_ = [[h, charge[h], discharge[h], grid_imp[h], soc[h]] for h in HOURS]
+
+    # Apply directives before building the balance so effective_solar is fixed
+    # by a solar directive when one is present.
+    solar_reduction_applied = False
+    for d in directives:
+        if _parse_directive_pairs(d).get("type") == "solar_reduction":
+            solar_reduction_applied = True
+        _apply_directive(prob, vars_, effective_solar, solar, d)
+
+    if not solar_reduction_applied:
+        for h in HOURS:
+            prob += effective_solar[h] == solar[h]
 
     # Objective: minimize total grid cost
     prob += lpSum(grid_imp[h] * price[h] for h in HOURS)
 
     # Energy balance per hour
     for h in HOURS:
-        prob += grid_imp[h] + solar[h] + discharge[h] - charge[h] == load[h]
+        prob += grid_imp[h] + effective_solar[h] + discharge[h] - charge[h] == load[h]
 
     # SoC dynamics
     for h in HOURS:
         prev = soc0 if h == 0 else soc[h - 1]
-        prob += soc[h] == prev + charge[h] * eta_c - discharge[h] / eta_d
+        prob += soc[h] == prev + charge[h] - discharge[h]
 
     # End-of-day neutrality
     prob += soc[23] == soc0
-
-    # Apply directives
-    for d in directives:
-        _apply_directive(prob, vars_, d)
 
     prob.solve(PULP_CBC_CMD(msg=0))
 

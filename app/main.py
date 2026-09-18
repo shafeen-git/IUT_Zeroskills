@@ -76,8 +76,6 @@ async def optimize_energy_endpoint(request: Request):
           ["initial_soc_kwh", 50.0],
           ["max_charge_kw", 50.0],
           ["max_discharge_kw", 50.0],
-          ["charge_efficiency", 0.95],
-          ["discharge_efficiency", 0.95],
         ]],
         ["directives", [ ...list of directive list-of-pairs... ]],
       ]

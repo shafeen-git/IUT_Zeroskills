@@ -33,13 +33,11 @@ def build_synthetic_request():
         ["initial_soc_kwh", 50.0],
         ["max_charge_kw", 50.0],
         ["max_discharge_kw", 50.0],
-        ["charge_efficiency", 0.95],
-        ["discharge_efficiency", 0.95],
     ]
 
-    # Directives: solar-reduction cap during 10-15, and force reserve at end-of-day
+    # Directives: reduce effective solar generation, and force reserve at end-of-day
     directives = [
-        ["type", "solar_reduction", "start_hour", 10, "end_hour", 15, "max_kw", 40.0],
+        ["type", "solar_reduction", "factor", 0.5],
         ["type", "minimum_battery_reserve", "start_hour", 22, "end_hour", 23, "reserve_kwh", 20.0],
     ]
 
@@ -57,12 +55,15 @@ def assert_balance(schedule, request):
     load = rd["load"]
     solar = rd["solar"]
     bat = dict(rd["battery"])
-    eta_c = bat.get("charge_efficiency", 1.0)
-    eta_d = bat.get("discharge_efficiency", 1.0)
+    effective_solar = rd.get("solar", [0.0] * 24)
+    for directive in rd.get("directives", []):
+        params = dict(zip(directive[::2], directive[1::2]))
+        if params.get("type") == "solar_reduction":
+            effective_solar = [value * params["factor"] for value in effective_solar]
 
     for row in schedule:
         h, ch, dis, gi, soc = row
-        balance = gi + solar[h] + dis - ch
+        balance = gi + effective_solar[h] + dis - ch
         assert abs(balance - load[h]) < 1e-6, (
             f"Hour {h}: energy balance violated ({balance} vs {load[h]})"
         )
@@ -72,7 +73,7 @@ def assert_balance(schedule, request):
     prev = soc0
     for row in schedule:
         h, ch, dis, gi, soc = row
-        expected = prev + ch * eta_c - dis / eta_d
+        expected = prev + ch - dis
         assert abs(soc - expected) < 1e-6, (
             f"Hour {h}: SoC dynamics violated ({soc} vs {expected})"
         )
@@ -185,16 +186,16 @@ def test_validation():
 
     bad = base_request_with_directives([
         ["type", "solar_reduction",
-         "start_hour", 10, "end_hour", 15, "max_kw", -1.0],
+         "factor", -1.0],
     ])
-    assert_raises(bad, "negative solar cap")
+    assert_raises(bad, "solar factor below zero")
 
-    # 5. Non-numeric cap
+    # 5. Non-numeric factor
     bad = base_request_with_directives([
         ["type", "solar_reduction",
-         "start_hour", 10, "end_hour", 15, "max_kw", "high"],
+         "factor", "high"],
     ])
-    assert_raises(bad, "non-numeric solar cap")
+    assert_raises(bad, "non-numeric solar factor")
 
     # 6. Valid edge case: window of 1 hour at boundary
     ok = base_request_with_directives([
