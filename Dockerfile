@@ -35,14 +35,19 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PORT=8000 \
     HOST=0.0.0.0
 
-# Copy only the compiled virtual environment from builder
+# Copy compiled virtual environment from builder
 COPY --from=builder /opt/venv /opt/venv
+
+# Install coinor-cbc solver for PuLP optimization
+RUN apt-get update && \
+    apt-get install --no-install-recommends -y coinor-cbc && \
+    rm -rf /var/lib/apt/lists/*
 
 # Create a non-root system user for secure container execution
 RUN groupadd -r appuser && useradd -r -g appuser -d /app -s /sbin/nologin appuser
 
-# Copy application source code (excluding files in .dockerignore)
-COPY app/ /app/app/
+# Copy application source code
+COPY . /app/
 
 # Set correct ownership for security
 RUN chown -R appuser:appuser /app
@@ -58,4 +63,5 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
     CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:' + __import__('os').getenv('PORT', '8000') + '/health')" || exit 1
 
 # Start the FastAPI server using uvicorn
-CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000} --workers 1"]
+CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000} --workers 1"]
+
