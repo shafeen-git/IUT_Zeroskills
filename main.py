@@ -6,6 +6,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import pulp
+from groq import Groq
 
 app = FastAPI(title="GridWise Energy Optimizer")
 
@@ -16,6 +17,11 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ----------------- GROQ CLIENT SETUP -----------------
+
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "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")
+groq_client = Groq(api_key=GROQ_API_KEY)
 
 # ----------------- SCHEMAS -----------------
 
@@ -79,18 +85,32 @@ def health():
 
 # ----------------- INTERPRETER & GUARDRAILS -----------------
 
-SYSTEM_PROMPT = """You are an expert energy scheduling assistant. Convert operator notes into structured directives for a 24-hour horizon (hours 0..23).
-Rules:
-1. Supported directives:
-   - "solar_reduction": {"hours": [int], "factor": float (0..1 remaining usable fraction)}
-   - "minimum_battery_reserve": {"hours": [int], "minimum_energy_kwh": float}
-   - "no_charge_window": {"hours": [int]}
-   - "no_discharge_window": {"hours": [int]}
-   - "max_grid_window": {"hours": [int], "max_grid_kwh": float}
-   - "no_op": structured_adjustment is null, applies is false.
-2. Hours are start-inclusive, end-exclusive. E.g., 1 PM to 3 PM -> [13, 14]. Whole hours only. Sorted ascending unique integers.
-3. For irrelevant notes, directive_type="no_op", applies=false, structured_adjustment=null.
-4. Output MUST be valid JSON: an array of objects matching DirectiveInterpretation for each note in note_index order (0..N-1).
+SYSTEM_PROMPT = """You are an expert energy scheduling assistant for BUP Smart Campus.
+Your job is to interpret natural-language operator notes into a structured JSON array of directives for a 24-hour horizon (hours 0 to 23).
+
+### SUPPORTED DIRECTIVE TYPES:
+1. "solar_reduction": Usable solar drops.
+   Required adjustment: {"hours": [int, ...], "factor": float}
+   * factor is the REMAINING usable fraction (0.0 to 1.0). E.g., an 80% reduction means factor = 0.2. "Drops to 25%" means factor = 0.25.
+2. "minimum_battery_reserve": Battery energy must stay at or above a threshold.
+   Required adjustment: {"hours": [int, ...], "minimum_energy_kwh": float}
+   * If given as a percentage, multiply by the battery capacity provided in the context. E.g., 50% of 200 kWh = 100.0.
+3. "no_charge_window": Battery cannot charge.
+   Required adjustment: {"hours": [int, ...]}
+4. "no_discharge_window": Battery cannot discharge.
+   Required adjustment: {"hours": [int, ...]}
+5. "max_grid_window": Grid import must stay at or below a limit.
+   Required adjustment: {"hours": [int, ...], "max_grid_kwh": float}
+6. "no_op": The note is an unrelated distractor (e.g., cafeteria, events, general campus announcements).
+   Required adjustment: null
+
+### RULES:
+- Return exactly one entry per note, strictly matching the note_index (0, 1, ... N-1).
+- Time windows are start-inclusive and end-exclusive (e.g., 1 PM to 3 PM -> [13, 14]; noon to 2 PM -> [12, 13]).
+- hours array must contain unique integers from 0 to 23 in ascending order.
+- applies must be true for all directives EXCEPT "no_op", where applies must be false.
+- structured_adjustment must be null for "no_op".
+- Output MUST be valid JSON with top-level key "directives": an array of objects with keys: note_index, applies, directive_type, structured_adjustment, explanation.
 """
 
 def parse_time_window(text: str) -> List[int]:
@@ -136,7 +156,7 @@ def rule_based_fallback(note: str, idx: int, battery_cap: float) -> DirectiveInt
                 val = float(pct_match.group(1)) / 100.0
                 if "drop to" in t or "leave" in t:
                     factor = val
-                elif "reduction" in t:
+                elif "reduction" in t or "cut" in t:
                     factor = round(1.0 - val, 2)
             elif "half" in t or "one-half" in t:
                 factor = 0.5
@@ -211,35 +231,28 @@ def rule_based_fallback(note: str, idx: int, battery_cap: float) -> DirectiveInt
     )
 
 def call_llm_interpreter(notes: List[str], battery_cap: float) -> List[DirectiveInterpretation]:
-    api_key = os.getenv("OPENAI_API_KEY")
-    if api_key:
-        import requests
-        try:
-            prompt = f"Capacity: {battery_cap} kWh\nNotes:\n" + "\n".join([f"[{i}]: {n}" for i, n in enumerate(notes)])
-            resp = requests.post(
-                "https://api.openai.com/v1/chat/completions",
-                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-                json={
-                    "model": "gpt-4o-mini",
-                    "messages": [
-                        {"role": "system", "content": SYSTEM_PROMPT},
-                        {"role": "user", "content": prompt}
-                    ],
-                    "response_format": {"type": "json_object"},
-                    "temperature": 0.0
-                },
-                timeout=5
-            )
-            if resp.status_code == 200:
-                data = resp.json()
-                content = json.loads(data["choices"][0]["message"]["content"])
-                items = content if isinstance(content, list) else content.get("directives", content.get("directive_interpretation", []))
-                results = [DirectiveInterpretation(**item) for item in items]
-                if len(results) == len(notes):
-                    return results
-        except Exception:
-            pass
+    if not notes:
+        return []
 
+    try:
+        user_content = f"Campus Battery Capacity: {battery_cap} kWh\nOperator Notes:\n{json.dumps(notes, indent=2)}"
+        response = groq_client.chat.completions.create(
+            model="openai/gpt-oss-20b",
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": user_content}
+            ],
+            response_format={"type": "json_object"},
+            temperature=0.0
+        )
+        data = json.loads(response.choices[0].message.content)
+        raw_list = data.get("directives", data.get("directive_interpretation", []))
+        if isinstance(raw_list, list) and len(raw_list) == len(notes):
+            return [DirectiveInterpretation(**item) for item in raw_list]
+    except Exception:
+        pass
+
+    # Safety fallback to regex rules if API fails or network drops
     return [rule_based_fallback(n, i, battery_cap) for i, n in enumerate(notes)]
 
 def validate_guardrails(directives: List[DirectiveInterpretation], notes_count: int, battery_cap: float) -> List[DirectiveInterpretation]:
@@ -327,7 +340,7 @@ def solve_schedule(req: OptimizeRequest, directives: List[DirectiveInterpretatio
 
     prob += e_after[23] == bat.initial_energy_kwh
 
-    prob.solve()
+    prob.solve(pulp.PULP_CBC_CMD(msg=0))
 
     if prob.status != pulp.constants.LpStatusOptimal:
         raise HTTPException(status_code=500, detail="Optimization problem infeasible under given constraints")
