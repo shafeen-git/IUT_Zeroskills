@@ -105,12 +105,12 @@ Your job is to interpret natural-language operator notes into a structured JSON 
    Required adjustment: null
 
 ### RULES:
-- Return exactly one entry per note, strictly matching the note_index (0, 1, ... N-1).
+- Return exactly one entry per note, using strict 0-based indexing for note_index: 0, 1, ... N-1. Do not use 1-based human list numbering.
 - Time windows are start-inclusive and end-exclusive (e.g., 1 PM to 3 PM -> [13, 14]; noon to 2 PM -> [12, 13]).
 - hours array must contain unique integers from 0 to 23 in ascending order.
 - applies must be true for all directives EXCEPT "no_op", where applies must be false.
 - structured_adjustment must be null for "no_op".
-- Output MUST be valid JSON with top-level key "directives": an array of objects with keys: note_index, applies, directive_type, structured_adjustment, explanation.
+- Output MUST be valid JSON with top-level key "directive_interpretation": an array of objects with keys: note_index, applies, directive_type, structured_adjustment, explanation.
 """
 
 def parse_time_window(text: str) -> List[int]:
@@ -209,17 +209,15 @@ def rule_based_fallback(note: str, idx: int, battery_cap: float) -> DirectiveInt
 
     # Max grid window
     if any(k in t for k in ["grid import", "grid intake", "grid limit", "transformer limit", "feeder"]):
-        kwh_match = re.search(r'(\d+)\s*kwh', t)
-        max_kwh = 150.0
+        kwh_match = re.search(r'(\d+(?:\.\d+)?)\s*kwh', t)
         if kwh_match:
-            max_kwh = float(kwh_match.group(1))
-        return DirectiveInterpretation(
-            note_index=idx,
-            applies=True,
-            directive_type="max_grid_window",
-            structured_adjustment={"hours": sorted(list(set(hours))), "max_grid_kwh": max_kwh},
-            explanation="Grid import capped during window."
-        )
+            return DirectiveInterpretation(
+                note_index=idx,
+                applies=True,
+                directive_type="max_grid_window",
+                structured_adjustment={"hours": sorted(list(set(hours))), "max_grid_kwh": float(kwh_match.group(1))},
+                explanation="Grid import capped during window."
+            )
 
     # Distractor / No-op
     return DirectiveInterpretation(
@@ -245,12 +243,22 @@ def call_llm_interpreter(notes: List[str], battery_cap: float) -> List[Directive
             response_format={"type": "json_object"},
             temperature=0.0
         )
-        data = json.loads(response.choices[0].message.content)
-        raw_list = data.get("directives", data.get("directive_interpretation", []))
-        if isinstance(raw_list, list) and len(raw_list) == len(notes):
-            return [DirectiveInterpretation(**item) for item in raw_list]
     except Exception:
         pass
+    else:
+        content = response.choices[0].message.content.strip()
+        if content.startswith("```"):
+            content = re.sub(r"^```(?:json)?\s*", "", content, count=1, flags=re.IGNORECASE)
+            content = re.sub(r"\s*```$", "", content).strip()
+
+        try:
+            data = json.loads(content)
+        except json.JSONDecodeError:
+            pass
+        else:
+            raw_list = data.get("directives", data.get("directive_interpretation", []))
+            if isinstance(raw_list, list) and len(raw_list) == len(notes):
+                return [DirectiveInterpretation(**item) for item in raw_list]
 
     # Safety fallback to regex rules if API fails or network drops
     return [rule_based_fallback(n, i, battery_cap) for i, n in enumerate(notes)]
