@@ -39,6 +39,7 @@ from pulp import (
     value,
     PULP_CBC_CMD,
 )
+from app.models import DirectiveInterpretation, HourlyPlan, OptimizeRequest
 
 HOURS = list(range(24))  # 0..23
 
@@ -175,11 +176,86 @@ def _apply_directive(prob, vars_, effective_solar, solar, directive):
                 prob += gi <= cap
 
 
-def optimize_energy(request):
+def _directive_to_pairs(directive: DirectiveInterpretation):
+    """Convert a standard directive interpretation to the internal pair format."""
+    if not directive.applies:
+        return ["type", "no_op"]
+
+    adjustment = directive.structured_adjustment
+    params = ["type", directive.directive_type]
+    if adjustment is not None and adjustment.hours:
+        params.extend([
+            "start_hour", min(adjustment.hours),
+            "end_hour", max(adjustment.hours),
+        ])
+    if adjustment is not None and adjustment.factor is not None:
+        parameter_name = {
+            "solar_reduction": "factor",
+            "minimum_battery_reserve": "reserve_kwh",
+            "max_grid_window": "max_kw",
+        }.get(directive.directive_type)
+        if parameter_name is not None:
+            params.extend([parameter_name, adjustment.factor])
+    return params
+
+
+def _request_to_pairs(request: OptimizeRequest, directives):
+    """Convert standard Pydantic inputs into the optimizer's internal pairs."""
+    return [
+        ["load", [hour.demand_kwh for hour in request.hours]],
+        ["solar", [hour.solar_kwh for hour in request.hours]],
+        ["grid_price", [hour.tariff_bdt_per_kwh for hour in request.hours]],
+        ["battery", [
+            ["capacity_kwh", request.battery.capacity_kwh],
+            ["initial_soc_kwh", request.battery.initial_energy_kwh],
+            ["max_charge_kw", request.battery.max_charge_kwh_per_hour],
+            ["max_discharge_kw", request.battery.max_discharge_kwh_per_hour],
+        ]],
+        ["directives", [_directive_to_pairs(directive) for directive in directives]],
+    ]
+
+
+def _format_hourly_plan(schedule, request, directives):
+    """Convert internal LP rows into the public HourlyPlan schema."""
+    solar_factor = 1.0
+    for directive in directives:
+        if (
+            directive.applies
+            and directive.directive_type == "solar_reduction"
+            and directive.structured_adjustment is not None
+            and directive.structured_adjustment.factor is not None
+        ):
+            solar_factor *= directive.structured_adjustment.factor
+
+    plans = []
+    for row, hour_input in zip(schedule, request.hours):
+        hour, charge, discharge, grid_import, soc = row
+        if charge > 1e-9:
+            battery_action = "charge"
+            battery_kwh = charge
+        elif discharge > 1e-9:
+            battery_action = "discharge"
+            battery_kwh = discharge
+        else:
+            battery_action = "idle"
+            battery_kwh = 0.0
+        effective_solar = hour_input.solar_kwh * solar_factor
+        plans.append(HourlyPlan(
+            hour=int(hour),
+            grid_kwh=float(grid_import),
+            solar_used_kwh=float(effective_solar),
+            battery_action=battery_action,
+            battery_kwh=float(battery_kwh),
+            battery_energy_after_kwh=float(soc),
+        ))
+    return plans
+
+
+def _optimize_internal(request):
     """
     Solve the 24-hour energy scheduling LP.
 
-    `request` shape (list-of-pairs per data-structure rule):
+    `request` is the internal list-of-pairs representation:
         [
           ["load", [kW for h in 0..23]],
           ["solar", [kW for h in 0..23]],
@@ -193,7 +269,7 @@ def optimize_energy(request):
           ["directives", [ list-of-directives, ... ]],   # each is list-of-pairs
         ]
 
-    Returns (status, schedule) where schedule is a 24-row list of
+    Returns (status, schedule) where schedule is a 24-row list of internal
     [hour, charge, discharge, grid_import, soc] numerical pairs.
     """
     rd = dict(request)
@@ -266,3 +342,14 @@ def optimize_energy(request):
         ])
 
     return status, schedule
+
+
+def optimize_energy(
+    request: OptimizeRequest,
+    directive_interpretations: list[DirectiveInterpretation] | None = None,
+):
+    """Solve a standard request and return rows matching the HourlyPlan schema."""
+    directives = directive_interpretations or []
+    internal_request = _request_to_pairs(request, directives)
+    status, schedule = _optimize_internal(internal_request)
+    return status, _format_hourly_plan(schedule, request, directives)

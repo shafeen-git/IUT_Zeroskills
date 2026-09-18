@@ -2,6 +2,7 @@ from fastapi import FastAPI, HTTPException, status
 from fastapi.responses import JSONResponse
 from fastapi import Request
 from app.config import get_config, get_runtime_secret
+from app.models import DirectiveInterpretation, OptimizeRequest
 from app.optimizer import optimize_energy
 
 # Initialize FastAPI application
@@ -65,33 +66,16 @@ def root():
 )
 async def optimize_energy_endpoint(request: Request):
     payload = await request.json()
-    """
-    Body shape (list-of-pairs per data-structure rule):
-      [
-        ["load", [kW for h in 0..23]],
-        ["solar", [kW for h in 0..23]],
-        ["grid_price", [per-kWh for h in 0..23]],
-        ["battery", [
-          ["capacity_kwh", 100.0],
-          ["initial_soc_kwh", 50.0],
-          ["max_charge_kw", 50.0],
-          ["max_discharge_kw", 50.0],
-        ]],
-        ["directives", [ ...list of directive list-of-pairs... ]],
-      ]
-
-    Response shape:
-      {
-        "status": "Optimal" | "Infeasible" | ...,
-        "total_cost": <float>,
-        "schedule": [
-          [hour, charge_kw, discharge_kw, grid_import_kw, soc_kwh],
-          ...
-        ]
-      }
-    """
     try:
-        lp_status, schedule = optimize_energy(payload)
+                optimization_request = OptimizeRequest.model_validate(payload)
+                interpretations = [
+                        DirectiveInterpretation.model_validate(item)
+                        for item in payload.get("directive_interpretation", [])
+                ]
+                lp_status, schedule = optimize_energy(
+                        optimization_request,
+                        interpretations,
+                )
     except Exception as exc:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -104,19 +88,12 @@ async def optimize_energy_endpoint(request: Request):
             detail=f"LP returned non-optimal status: {lp_status}",
         )
 
-    total_cost = 0.0
-    # Re-derive cost for the response using grid_price from the request
-    rd = dict(payload)
-    price = rd.get("grid_price", [0.0] * 24)
-    for row in schedule:
-        h = int(row[0])
-        grid_import = float(row[3])
-        if 0 <= h < len(price):
-            total_cost += grid_import * float(price[h])
-
-    response_pairs = [
-        ["status", lp_status],
-        ["total_cost", round(total_cost, 4)],
-        ["schedule", schedule],
-    ]
-    return dict(response_pairs)
+    total_cost = sum(
+        plan.grid_kwh * hour.tariff_bdt_per_kwh
+        for plan, hour in zip(schedule, optimization_request.hours)
+    )
+    return {
+        "status": lp_status,
+        "total_cost": round(total_cost, 4),
+        "schedule": [plan.model_dump() for plan in schedule],
+    }
